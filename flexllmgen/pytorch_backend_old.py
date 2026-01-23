@@ -288,7 +288,10 @@ class TorchDevice:
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.n_head, config.input_dim, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
+        
+        group_size = 8
+        num_kv_head = num_head // group_size
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_kv_head, hidden_size // num_head)
         # NOTE: disable pin_memory due to high memory overhead
         pin_memory = False
         k_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
@@ -297,7 +300,7 @@ class TorchDevice:
 
     def mha(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
             w_out, b_out, w_ln, b_ln, n_head, donate, compress_cache, comp_config):
-        """Multi-head attention (prefill phase)."""
+        """GQA(based on Multi-head attention) (prefill phase)."""
         # decompress weights
         if w_q.device.device_type == DeviceType.COMPRESSED:
             w_q = w_q.device.decompress(w_q)
@@ -308,42 +311,70 @@ class TorchDevice:
         b, s, h = inputs.shape
         head_dim = h // n_head
         scaling = head_dim ** -0.5
-
+        
         hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
+
+        # for GQA
+        group_size = 8
+        n_q = n_head
+        assert n_q % group_size == 0, f"n_q({n_q}) must be divisible by group_size({group_size})"
+        n_kv = n_q // group_size
+        assert n_q == n_kv * group_size
+        assert head_dim * n_q == h, f"head_dim({head_dim})*n_q({n_q}) != h({h})"
+        assert attention_mask.data.dtype == torch.bool, f"attention_mask must be bool, got {attention_mask.data.dtype}"
+
+        w_k_gqa = w_k.data.view(n_q, head_dim, h).view(n_kv, group_size, head_dim, h).mean(dim=1).reshape(n_kv * head_dim, h)
+        b_k_gqa = b_k.data.view(n_q, head_dim).view(n_kv, group_size, head_dim).mean(dim=1).reshape(n_kv * head_dim)
+        assert w_k_gqa.shape == (n_kv * head_dim, h)
+
+        w_v_gqa = w_v.data.view(n_q, head_dim, h).view(n_kv, group_size, head_dim, h).mean(dim=1).reshape(n_kv * head_dim, h)
+        b_v_gqa = b_v.data.view(n_q, head_dim).view(n_kv, group_size, head_dim).mean(dim=1).reshape(n_kv * head_dim)
+        assert w_v_gqa.shape == (n_kv * head_dim, h)
 
         # shape: (b, s, h)
         q = F.linear(hidden, w_q.data, bias=b_q.data) * scaling
-        k = F.linear(hidden, w_k.data, bias=b_k.data)
-        v = F.linear(hidden, w_v.data, bias=b_v.data)
-        # shape: (b, s, n_head, head_dim)
-        q = q.view(b, s, n_head, head_dim)
-        k = k.view(b, s, n_head, head_dim)
-        v = v.view(b, s, n_head, head_dim)
+        k = F.linear(hidden, w_k_gqa, bias=b_k_gqa)
+        v = F.linear(hidden, w_v_gqa, bias=b_v_gqa)
 
-        # shape: (b * n_head, s, head_dim)
-        q = q.permute(0, 2, 1, 3).reshape(b * n_head, s, head_dim)
-        # shape: (b * n_head, head_dim, s)
-        k = k.permute(0, 2, 3, 1).reshape(b * n_head, head_dim, s)
-        # shape: (b * n_head, s, head_dim)
-        v = v.permute(0, 2, 1, 3).reshape(b * n_head, s, head_dim)
+        # shape: (b, s, n_q, head_dim)
+        q = q.view(b, s, n_q, head_dim)
+        k = k.view(b, s, n_kv, head_dim)
+        v = v.view(b, s, n_kv, head_dim)
+        assert q.shape == (b, s, n_q, head_dim)
+        assert k.shape == (b, s, n_kv, head_dim)
+        assert v.shape == (b, s, n_kv, head_dim)
 
-        # shape: (b * n_head, s, s)
-        attn_weights = torch.bmm(q, k)
+        # shape: (b, n_q, s, head_dim)
+        q = q.permute(0, 2, 1, 3).contiguous()
+        # shape: (b, n_kv, head_dim, s) -> (b, n_kv, 1, head_dim, s)
+        k = k.permute(0, 2, 3, 1).contiguous().unsqueeze(2)
+        # shape: (b, n_kv, s, head_dim) -> (b, n_kv, 1, s, head_dim)
+        v = v.permute(0, 2, 1, 3).contiguous().unsqueeze(2)
+    
+        # shape: (b, n_kv, group_size, s, head_dim)
+        q = q.view(b, n_kv, group_size, s, head_dim)
+        assert q.shape == (b, n_kv, group_size, s, head_dim)
 
-        # shape: (b, 1, s, s)
+        # shape: (b, n_kv, group_size, s, s)
+        attn_weights = torch.matmul(q, k)
+        assert attn_weights.shape == (b, n_kv, group_size, s, s)
+
+        # shape: (b, 1,1, s, s)
         idx = torch.arange(s, device=self.dev)
-        causal_mask = (idx <= idx.view(s, 1)).view(1, 1, s, s)
-        mask = attention_mask.data.view(b, 1, 1, s) & causal_mask
+        causal_mask = (idx <= idx.view(s, 1)).view(1, 1, 1, s, s)
+        mask = attention_mask.data.view(b, 1, 1, 1, s) & causal_mask
+        assert mask.shape == (b, 1, 1, s, s)
 
-        # shape: (b, n_head, s, s)
-        attn_weights = attn_weights.view(b, n_head, s, s)
+        # shape: (b, n_kv, group_size, s, s)
         attn_weights = torch.where(mask, attn_weights, -1e4)
-        attn_weights = attn_weights.view(b * n_head, s, s)
-        attn_weights = F.softmax(attn_weights, dim=2)
-        # shape: (b, n_head, s, head_dim)
-        value = torch.bmm(attn_weights, v).view(b, n_head, s, head_dim)
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        
+        # shape: (b, n_kv, group_size, s, head_dim) -> (b, n_q, s, head_dim)
+        value = torch.matmul(attn_weights, v).contiguous().view(b, n_q, s, head_dim)
+        assert value.shape == (b, n_q, s, head_dim)
         # shape: (b, s, h)
         value = value.transpose(1, 2).reshape(b, s, h)
+        assert value.shape == (b, s, h)
         value = F.linear(value, w_out.data, bias=b_out.data)
 
         value.add_(inputs.data)
@@ -351,9 +382,10 @@ class TorchDevice:
         if donate[0]: inputs.delete()
         if donate[1]: attention_mask.delete()
 
-        # (s, b * n_head, head_dim)
-        k = k.permute(2, 0, 1)
-        v = v.permute(1, 0, 2)
+        # (s, b * n_kv, head_dim)
+        k = k.squeeze(2).permute(3, 0, 1, 2).contiguous().view(s, b * n_kv, head_dim)
+        v = v.squeeze(2).permute(2, 0, 1, 3).contiguous().view(s, b * n_kv, head_dim) 
+        assert k.shape == (s, b * n_kv, head_dim) and v.shape == (s, b * n_kv, head_dim)
 
         if compress_cache:
             k = self.compressed_device.compress(k, comp_config)
@@ -367,7 +399,7 @@ class TorchDevice:
     def mha_gen(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
                 w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, donate,
                 attn_sparsity, compress_cache, comp_config):
-        """Multi-head attention (decoding phase)."""
+        """GQA(based on Multi-head attention) (decoding phase)."""
         # decompress weights
         if w_q.device.device_type == DeviceType.COMPRESSED:
             w_q = w_q.device.decompress(w_q)
@@ -382,69 +414,136 @@ class TorchDevice:
 
         hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
 
+        # for GQA
+        group_size = 8
+        n_q = n_head
+        assert n_q % group_size == 0, f"n_q({n_q}) must be divisible by group_size({group_size})"
+        n_kv = n_q // group_size
+        assert n_q == n_kv * group_size
+        assert head_dim * n_q == h, f"head_dim({head_dim})*n_q({n_q}) != h({h})"
+        assert attn_sparsity >= 1.0, "This version assumes dense decoding only (attn_sparsity >= 1.0)"
+        assert isinstance(k_cache, TorchTensor), "This version assumes TorchTensor cache (dense path only)"
+        assert attention_mask.data.dtype == torch.bool, f"attention_mask must be bool, got {attention_mask.data.dtype}"
+
+        print()
+        print("b:", b, "src_s:", src_s, "tgt_s:", tgt_s, "h:", h, "head_dim:", head_dim)
+        print("n_q:", n_q, "n_kv:", n_kv, "group_size:", group_size)
+        print("w_k.data shape:", w_k.data.shape, "b_k.data shape:", b_k.data.shape)
+
+        w_k_gqa = w_k.data.view(n_q, head_dim, h).view(n_kv, group_size, head_dim, h).mean(dim=1).reshape(n_kv * head_dim, h)
+        b_k_gqa = b_k.data.view(n_q, head_dim).view(n_kv, group_size, head_dim).mean(dim=1).reshape(n_kv * head_dim)
+        assert w_k_gqa.shape == (n_kv * head_dim, h)
+        print("w_k_gqa shape:", w_k_gqa.shape, "b_k_gqa shape:", b_k_gqa.shape)
+
+        w_v_gqa = w_v.data.view(n_q, head_dim, h).view(n_kv, group_size, head_dim, h).mean(dim=1).reshape(n_kv * head_dim, h)
+        b_v_gqa = b_v.data.view(n_q, head_dim).view(n_kv, group_size, head_dim).mean(dim=1).reshape(n_kv * head_dim)
+        assert w_v_gqa.shape == (n_kv * head_dim, h)
+
         # shape: (b, 1, h)
         q = F.linear(hidden, w_q.data, bias=b_q.data) * scaling
-        k = F.linear(hidden, w_k.data, bias=b_k.data)
-        v = F.linear(hidden, w_v.data, bias=b_v.data)
-        # shape: (b, 1, n_head, head_dim)
-        q = q.view(b, tgt_s, n_head, head_dim)
-        k = k.view(b, tgt_s, n_head, head_dim)
-        v = v.view(b, tgt_s, n_head, head_dim)
+        k = F.linear(hidden, w_k_gqa, bias=b_k_gqa)
+        v = F.linear(hidden, w_v_gqa, bias=b_v_gqa)
+        # shape: (b, 1, n_q, head_dim)
+        q = q.view(b, tgt_s, n_q, head_dim)
+        k = k.view(b, tgt_s, n_kv, head_dim)
+        v = v.view(b, tgt_s, n_kv, head_dim)
+        assert q.shape == (b, tgt_s, n_q, head_dim)
+        assert k.shape == (b, tgt_s, n_kv, head_dim)
+        assert v.shape == (b, tgt_s, n_kv, head_dim)
 
-        # shape: (b * n_head, 1, head_dim)
-        q = q.permute(0, 2, 1, 3).reshape(b * n_head, tgt_s, head_dim)
-        # shape: (1, b * n_head, head_dim)
-        k_new = k.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
-        # shape: (1, b * n_head, head_dim)
-        v_new = v.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
+        # shape: (b, n_q, 1, head_dim)
+        q = q.permute(0, 2, 1, 3).contiguous().view(b, n_q, tgt_s, head_dim)
+        # shape: (b, n_kv, group_size, 1, head_dim)
+        q = q.view(b, n_kv, group_size, tgt_s, head_dim)
+        assert q.shape == (b, n_kv, group_size, tgt_s, head_dim)
+
+        # shape: (1, b, n_kv, head_dim)
+        k_new = k.permute(1, 0, 2, 3).contiguous().view(tgt_s, b * n_kv, head_dim)
+        # shape: (1, b, n_kv, head_dim)
+        v_new = v.permute(1, 0, 2, 3).contiguous().view(tgt_s, b * n_kv, head_dim)
+        assert k_new.shape == (tgt_s, b * n_kv, head_dim)
+        assert v_new.shape == (tgt_s, b * n_kv, head_dim)
 
         if isinstance(k_cache, TorchTensor):
             if attn_sparsity >= 1.0:  # Dense attention
                 if compress_cache:
-                    # shape: (s, b * n_head, head_dim)
+                    # shape: (s, b * n_kv, head_dim)
                     k = k_cache.device.decompress(k_cache)[:src_s]
                     v = v_cache.device.decompress(v_cache)[:src_s]
                 else:
-                    # shape: (s, b * n_head, head_dim)
+                    # shape: (s, b * n_kv, head_dim)
                     k = k_cache.data[:src_s]
                     v = v_cache.data[:src_s]
+                
                 k[src_s - 1:src_s] = k_new
                 v[src_s - 1:src_s] = v_new
 
-                # shape: (b * n_head, head_dim, s)
-                k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
-                # shape: (b * n_head, s, head_dim)
-                v = v.permute(1, 0, 2).reshape(b * n_head, src_s, head_dim)
+                assert k.shape == (src_s, b * n_kv, head_dim)
+                assert v.shape == (src_s, b * n_kv, head_dim)
+                # shape: (b * n_kv, head_dim, s) -> (b, n_kv, head_dim, src_s) -> (b, n_kv, 1, head_dim, src_s)
+                k = k.permute(1, 2, 0).contiguous().view(b, n_kv, head_dim, src_s).unsqueeze(2)
+                # shape: (b * n_kv, s, head_dim) -> (b, n_kv, src_s, head_dim) -> (b, n_kv, 1, src_s, head_dim)
+                v = v.permute(1, 0, 2).contiguous().view(b, n_kv, src_s, head_dim).unsqueeze(2)
+                assert k.shape == (b, n_kv, 1, head_dim, src_s)
+                assert v.shape == (b, n_kv, 1, src_s, head_dim)
+
+                print("attn ready:",
+                "q", tuple(q.shape),
+                "k", tuple(k.shape),
+                "v", tuple(v.shape),
+                "mask", tuple(attention_mask.data.shape))
 
                 if k.is_cuda:
-                    value = self._attention_value(q, k, v, attention_mask.data,
-                        b, src_s, tgt_s, n_head, head_dim)
+                    # q shape: (b, n_kv, group_size, 1, head_dim)
+                    # shape: (b, n_q, group_size, 1, src_s)
+                    attn_weights = torch.matmul(q, k)
+                    mask = attention_mask.data.view(b, 1, 1, 1, src_s)
+                    if mask.device != attn_weights.device:
+                        mask = mask.to(attn_weights.device)
+
+                    attn_weights = torch.where(mask, attn_weights, -1e4)
+                    attn_weights = F.softmax(attn_weights, dim=-1)
+
+                    # shape: (b, n_q, tgt_s, head_dim)
+                    value = torch.matmul(attn_weights, v).contiguous().view(b, n_q, tgt_s, head_dim)
                 else:
-                    q = q.float().cpu()
-                    k, v = k.float(), v.float()
-                    value = self._attention_value(q, k, v, attention_mask.data,
-                        b, src_s, tgt_s, n_head, head_dim).cuda().half()
+                    q = q.float().cpu(); k = k.float().cpu(); v = v.float().cpu()
+
+                    attn_weights = torch.matmul(q, k)
+                    mask = attention_mask.data.view(b, 1, 1, 1, src_s)
+                    if mask.is_cuda:
+                        mask = mask.cpu()
+
+                    attn_weights = torch.where(mask, attn_weights, -1e4)
+                    attn_weights = F.softmax(attn_weights, dim=-1)
+                    value = torch.matmul(attn_weights, v).contiguous().view(b, n_q, tgt_s, head_dim).cuda().half()
+                print("attn/value:",
+                    "attn", tuple(attn_weights.shape),
+                    "value", tuple(value.shape))
+                assert attn_weights.shape == (b, n_kv, group_size, tgt_s, src_s)
+                assert value.shape == (b, n_q, tgt_s, head_dim)
             else:  # Sparse attention
-                # shape: (s, b * n_head, head_dim)
+                # shape: (s, b * n_q, head_dim)
                 k = k_cache.data[:src_s]
                 k[src_s - 1:src_s] = k_new
-                # shape: (b * n_head, head_dim, s)
-                k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
-
+                # shape: (b * n_q, head_dim, s)
+                k = k.permute(1, 2, 0).reshape(b * n_q, head_dim, src_s)
                 if k.is_cuda:
                     value = self._sparse_attention_value(q, k, v_new, v_cache,
-                        attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
+                        attention_mask.data, b, src_s, tgt_s, n_q, head_dim,
                         attn_sparsity)
                 else:
                     q = q.float().cpu()
                     value = self._sparse_attention_value(q, k, v_new, v_cache,
-                        attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
+                        attention_mask.data, b, src_s, tgt_s, n_q, head_dim,
                         attn_sparsity).cuda().half()
         else:  # Mixed device attention
             assert attn_sparsity >= 1.0
             value = self._mixed_device_attention(q, k_cache, v_cache,
                 k_new, v_new, attention_mask.data, b, src_s, tgt_s,
                 n_head, head_dim)
+
+        k.squeeze_(2); v.squeeze_(2)
 
         # shape: (b, 1, h)
         value = value.transpose(1, 2).view(b, tgt_s, h)
@@ -668,7 +767,11 @@ class TorchDisk:
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.n_head, config.input_dim, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
+
+        group_size = 8
+        num_kv_head = num_head // group_size
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_kv_head, hidden_size // num_head)
+        # shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
         k_cache = self.allocate(shape, np.float16)
         v_cache = self.allocate(shape, np.float16)
         return k_cache, v_cache
@@ -739,7 +842,10 @@ class TorchMixedDevice:
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.n_head, config.input_dim, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
+        group_size = 8
+        num_kv_head = num_head // group_size
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_kv_head, hidden_size // num_head)
+        # shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
 
         # We have to round to a multiple of `num_head`
         if policy.cache_disk_percent == 0:
@@ -904,503 +1010,3 @@ def copy_worker_func(queue, cuda_id):
                 dst_data.copy_(src_data)
 
             queue.task_done()
-
-# For Llama
-
-def rms_norm(input, weight, eps) -> torch.Tensor:
-    input_dtype = input.dtype
-    hidden_states = input.to(torch.float32)
-    variance = hidden_states.pow(2).mean(-1, keepdim=True)
-    hidden_states = hidden_states * torch.rsqrt(variance + eps)
-    return weight * hidden_states.to(input_dtype)
-
-
-def rotary_embedding(x, inv_freq, seq_len):
-    t = torch.arange(seq_len, device=x.device, dtype=inv_freq.dtype)
-    freqs = torch.outer(t, inv_freq.to(x.device))
-    emb = torch.cat((freqs, freqs), dim=-1)
-    return (
-        emb.cos().to(x.dtype)[:seq_len].to(dtype=x.dtype),
-        emb.sin().to(x.dtype)[:seq_len].to(dtype=x.dtype),
-    )
-
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=2):
-    """Applies Rotary Position Embedding to the query and key tensors.
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`):
-            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
-            used to pass offsetted position ids when working with a KV-cache.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    seqlen, num_key_value_heads, head_dim) to (batch, seqlen, num_attention_heads, head_dim)
-    """
-    batch, slen, num_key_value_heads, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, :, None, :].expand(batch, slen, num_key_value_heads, n_rep, head_dim)
-    return hidden_states.reshape(batch, slen, num_key_value_heads * n_rep, head_dim)
-
-
-class LlamaTorchDevice(TorchDevice):
-
-    def llama_input_embed(self, inputs, attention_mask, w_token, pad_token_id, donate):
-        # decompress weights
-        if w_token.device.device_type == DeviceType.COMPRESSED:
-            w_token = w_token.device.decompress(w_token)
-
-        token_ids = inputs.data
-        if donate[0]: inputs.delete()
-        if donate[1]: attention_mask.delete()
-
-        # token embedding
-        token_embed = F.embedding(token_ids, w_token.data, pad_token_id)
-
-        return TorchTensor.create_from_torch(token_embed, self)
-
-    def llama_output_embed(self, inputs, w_ln, w_token, eps, donate, do_sample, temperature):
-        # decompress weights
-        if w_token.device.device_type == DeviceType.COMPRESSED:
-            w_token = w_token.device.decompress(w_token)
-
-        hidden = rms_norm(inputs.data, weight=w_ln.data, eps=eps)
-        if donate[0]: inputs.delete()
-
-        # output embedding
-        logits = F.linear(hidden, w_token.data)
-        last_token_logits = logits[:,-1,:]
-
-        if do_sample and not temperature < 1e-5:
-            probs = torch.softmax(last_token_logits / temperature, dim=-1)
-            ids = torch.multinomial(probs, num_samples=1)
-        else:
-            ids = last_token_logits.argmax(dim=1, keepdim=True)
-        return TorchTensor.create_from_torch(ids, self)
-
-    def llama_mha(self, inputs, position_ids, attention_mask, w_ln, w_q, w_k, w_v,
-            w_re, w_out, n_head, n_kv_head, donate, eps, compress_cache, comp_config):
-        """Multi-head attention (prefill phase)."""
-        # decompress weights
-        if w_q.device.device_type == DeviceType.COMPRESSED:
-            w_q = w_q.device.decompress(w_q)
-            w_k = w_k.device.decompress(w_k)
-            w_v = w_v.device.decompress(w_v)
-            w_re = w_re.device.decompress(w_re)
-            w_out = w_out.device.decompress(w_out)
-
-        b, s, h = inputs.shape
-        head_dim = h // n_head
-        scaling = head_dim ** -0.5
-
-        hidden = rms_norm(inputs.data, weight=w_ln.data, eps=eps)
-
-        # shape: (b, s, h)
-        q = F.linear(hidden, w_q.data) * scaling
-        k = F.linear(hidden, w_k.data)
-        v = F.linear(hidden, w_v.data)
-        # shape: (b, s, n_head, head_dim)
-        q = q.view(b, s, n_head, head_dim)
-        k = k.view(b, s, n_kv_head, head_dim)
-        v = v.view(b, s, n_kv_head, head_dim)
-
-        kv_seq_len = k.shape[-3]
-        cos, sin = rotary_embedding(v, w_re.data, seq_len=kv_seq_len)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
-
-        n_kv_groups = n_head // n_kv_head
-        k = repeat_kv(k, n_kv_groups)
-        v = repeat_kv(v, n_kv_groups)
-
-        # shape: (b * n_head, s, head_dim)
-        q = q.permute(0, 2, 1, 3).reshape(b * n_head, s, head_dim)
-        # shape: (b * n_head, head_dim, s)
-        k = k.permute(0, 2, 3, 1).reshape(b * n_head, head_dim, s)
-        # shape: (b * n_head, s, head_dim)
-        v = v.permute(0, 2, 1, 3).reshape(b * n_head, s, head_dim)
-
-        # shape: (b * n_head, s, s)
-        attn_weights = torch.bmm(q, k)
-
-        # shape: (b, 1, s, s)
-        idx = torch.arange(s, device=self.dev)
-        causal_mask = (idx <= idx.view(s, 1)).view(1, 1, s, s)
-        mask = attention_mask.data.view(b, 1, 1, s) & causal_mask
-
-        # shape: (b, n_head, s, s)
-        attn_weights = attn_weights.view(b, n_head, s, s)
-        attn_weights = torch.where(mask, attn_weights, -1e4)
-        attn_weights = attn_weights.view(b * n_head, s, s)
-        attn_weights = F.softmax(attn_weights, dim=2)
-        # shape: (b, n_head, s, head_dim)
-        value = torch.bmm(attn_weights, v).view(b, n_head, s, head_dim)
-        # shape: (b, s, h)
-        value = value.transpose(1, 2).reshape(b, s, h)
-        value = F.linear(value, w_out.data)
-
-        value.add_(inputs.data)
-
-        if donate[0]: inputs.delete()
-        if donate[1]: attention_mask.delete()
-
-        # (s, b * n_head, head_dim)
-        k = k.permute(2, 0, 1)
-        v = v.permute(1, 0, 2)
-
-        if compress_cache:
-            k = self.compressed_device.compress(k, comp_config)
-            v = self.compressed_device.compress(v, comp_config)
-        else:
-            k = TorchTensor.create_from_torch(k, self)
-            v = TorchTensor.create_from_torch(v, self)
-
-        return TorchTensor.create_from_torch(value, self), k, v
-
-    def llama_mha_gen(self, inputs, position_ids, attention_mask, w_ln, w_q, w_k, w_v,
-                w_re, w_out, eps, n_head, n_kv_head, k_cache, v_cache, donate,
-                attn_sparsity, compress_cache, comp_config):
-        """Multi-head attention (decoding phase)."""
-        # decompress weights
-        if w_q.device.device_type == DeviceType.COMPRESSED:
-            w_q = w_q.device.decompress(w_q)
-            w_k = w_k.device.decompress(w_k)
-            w_v = w_v.device.decompress(w_v)
-            w_re = w_re.device.decompress(w_re)
-            w_out = w_out.device.decompress(w_out)
-
-        b, tgt_s, h = inputs.shape
-        src_s = attention_mask.shape[1]
-        head_dim = h // n_head
-        scaling = head_dim ** -0.5
-
-        hidden = rms_norm(inputs.data, weight=w_ln.data, eps=eps)
-
-        # shape: (b, 1, h)
-        q = F.linear(hidden, w_q.data) * scaling
-        k = F.linear(hidden, w_k.data)
-        v = F.linear(hidden, w_v.data)
-        # shape: (b, 1, n_head, head_dim)
-        q = q.view(b, tgt_s, n_head, head_dim)
-        k = k.view(b, tgt_s, n_kv_head, head_dim)
-        v = v.view(b, tgt_s, n_kv_head, head_dim)
-
-        cos, sin = rotary_embedding(v, w_re.data, seq_len=position_ids.max().item() + 1)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
-
-        n_kv_groups = n_head // n_kv_head
-        k = repeat_kv(k, n_kv_groups)
-        v = repeat_kv(v, n_kv_groups)
-
-        # shape: (b * n_head, 1, head_dim)
-        q = q.permute(0, 2, 1, 3).reshape(b * n_head, tgt_s, head_dim)
-        # shape: (1, b * n_head, head_dim)
-        k_new = k.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
-        # shape: (1, b * n_head, head_dim)
-        v_new = v.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
-
-        if isinstance(k_cache, TorchTensor):
-            if attn_sparsity >= 1.0:  # Dense attention
-                if compress_cache:
-                    # shape: (s, b * n_head, head_dim)
-                    k = k_cache.device.decompress(k_cache)[:src_s]
-                    v = v_cache.device.decompress(v_cache)[:src_s]
-                else:
-                    # shape: (s, b * n_head, head_dim)
-                    k = k_cache.data[:src_s]
-                    v = v_cache.data[:src_s]
-                k[src_s - 1:src_s] = k_new
-                v[src_s - 1:src_s] = v_new
-
-                # shape: (b * n_head, head_dim, s)
-                k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
-                # shape: (b * n_head, s, head_dim)
-                v = v.permute(1, 0, 2).reshape(b * n_head, src_s, head_dim)
-
-                if k.is_cuda:
-                    value = self._attention_value(q, k, v, attention_mask.data,
-                        b, src_s, tgt_s, n_head, head_dim)
-                else:
-                    q = q.float().cpu()
-                    k, v = k.float(), v.float()
-                    value = self._attention_value(q, k, v, attention_mask.data,
-                        b, src_s, tgt_s, n_head, head_dim).cuda().half()
-            else:  # Sparse attention
-                # shape: (s, b * n_head, head_dim)
-                k = k_cache.data[:src_s]
-                k[src_s - 1:src_s] = k_new
-                # shape: (b * n_head, head_dim, s)
-                k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
-
-                if k.is_cuda:
-                    value = self._sparse_attention_value(q, k, v_new, v_cache,
-                        attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
-                        attn_sparsity)
-                else:
-                    q = q.float().cpu()
-                    value = self._sparse_attention_value(q, k, v_new, v_cache,
-                        attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
-                        attn_sparsity).cuda().half()
-        else:  # Mixed device attention
-            assert attn_sparsity >= 1.0
-            value = self._mixed_device_attention(q, k_cache, v_cache,
-                k_new, v_new, attention_mask.data, b, src_s, tgt_s,
-                n_head, head_dim)
-
-        # shape: (b, 1, h)
-        value = value.transpose(1, 2).view(b, tgt_s, h)
-        value = F.linear(value, w_out.data)
-
-        value.add_(inputs.data)
-
-        if donate[0]: inputs.delete()
-        if donate[1]: attention_mask.delete()
-
-        if compress_cache:
-            if comp_config.group_dim == 0:
-                s_ = src_s // comp_config.group_size * comp_config.group_size
-                k_new = k[:, :, s_:].permute(2, 0, 1)
-                v_new = v[:, s_:, :].permute(1, 0, 2)
-            k_new = self.compressed_device.compress(k_new, comp_config)
-            v_new = self.compressed_device.compress(v_new, comp_config)
-        else:
-            k_new = TorchTensor.create_from_torch(k_new, self)
-            v_new = TorchTensor.create_from_torch(v_new, self)
-
-        return TorchTensor.create_from_torch(value, self), k_new, v_new
-
-    def llama_mlp(self, inputs, w_ln, w_g, w_u, w_d, eps, donate):
-        # decompress weights
-        if w_ln.device.device_type == DeviceType.COMPRESSED:
-            w_g = w_g.device.decompress(w_g)
-            w_u = w_g.device.decompress(w_u)
-            w_d = w_g.device.decompress(w_d)
-
-        out = rms_norm(inputs.data, weight=w_ln.data, eps=eps)
-        gate_out = F.linear(out, w_g.data)
-        F.silu(gate_out, inplace=True)
-        up_out = F.linear(out, w_u.data)
-        out = F.linear(gate_out * up_out, w_d.data)
-        out.add_(inputs.data)
-        if donate[0]: inputs.delete()
-        return TorchTensor.create_from_torch(out, self)
-    
-# For Qwen
-class QwenTorchDevice(LlamaTorchDevice):
-
-    def qwen_mha(self, inputs, position_ids, attention_mask, w_ln, w_q, b_q, w_k, b_k, w_v, b_v,
-            w_out, n_head, n_kv_head, donate, eps, rope_theta, compress_cache, comp_config):
-        """Multi-head attention (prefill phase)."""
-        # decompress weights
-        if w_q.device.device_type == DeviceType.COMPRESSED:
-            w_q = w_q.device.decompress(w_q)
-            w_k = w_k.device.decompress(w_k)
-            w_v = w_v.device.decompress(w_v)
-            w_out = w_out.device.decompress(w_out)
-
-        b, s, h = inputs.shape
-        head_dim = h // n_head
-        scaling = head_dim ** -0.5
-
-        hidden = rms_norm(inputs.data, weight=w_ln.data, eps=eps)
-
-        # shape: (b, s, h)
-        q = F.linear(hidden, w_q.data, b_q.data) * scaling
-        k = F.linear(hidden, w_k.data, b_k.data)
-        v = F.linear(hidden, w_v.data, b_v.data)
-        # shape: (b, s, n_head, head_dim)
-        q = q.view(b, s, n_head, head_dim)
-        k = k.view(b, s, n_kv_head, head_dim)
-        v = v.view(b, s, n_kv_head, head_dim)
-
-        kv_seq_len = k.shape[-3]
-        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
-        cos, sin = rotary_embedding(v, inv_freq, seq_len=kv_seq_len)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
-
-        n_kv_groups = n_head // n_kv_head
-        k = repeat_kv(k, n_kv_groups)
-        v = repeat_kv(v, n_kv_groups)
-
-        # shape: (b * n_head, s, head_dim)
-        q = q.permute(0, 2, 1, 3).reshape(b * n_head, s, head_dim)
-        # shape: (b * n_head, head_dim, s)
-        k = k.permute(0, 2, 3, 1).reshape(b * n_head, head_dim, s)
-        # shape: (b * n_head, s, head_dim)
-        v = v.permute(0, 2, 1, 3).reshape(b * n_head, s, head_dim)
-
-        # shape: (b * n_head, s, s)
-        attn_weights = torch.bmm(q, k)
-
-        # shape: (b, 1, s, s)
-        idx = torch.arange(s, device=self.dev)
-        causal_mask = (idx <= idx.view(s, 1)).view(1, 1, s, s)
-        mask = attention_mask.data.view(b, 1, 1, s) & causal_mask
-
-        # shape: (b, n_head, s, s)
-        attn_weights = attn_weights.view(b, n_head, s, s)
-        attn_weights = torch.where(mask, attn_weights, -1e4)
-        attn_weights = attn_weights.view(b * n_head, s, s)
-        attn_weights = F.softmax(attn_weights, dim=2)
-        # shape: (b, n_head, s, head_dim)
-        value = torch.bmm(attn_weights, v).view(b, n_head, s, head_dim)
-        # shape: (b, s, h)
-        value = value.transpose(1, 2).reshape(b, s, h)
-        value = F.linear(value, w_out.data)
-
-        value.add_(inputs.data)
-
-        if donate[0]: inputs.delete()
-        if donate[1]: attention_mask.delete()
-
-        # (s, b * n_head, head_dim)
-        k = k.permute(2, 0, 1)
-        v = v.permute(1, 0, 2)
-
-        if compress_cache:
-            k = self.compressed_device.compress(k, comp_config)
-            v = self.compressed_device.compress(v, comp_config)
-        else:
-            k = TorchTensor.create_from_torch(k, self)
-            v = TorchTensor.create_from_torch(v, self)
-
-        return TorchTensor.create_from_torch(value, self), k, v
-
-    def qwen_mha_gen(self, inputs, position_ids, attention_mask, w_ln, w_q, b_q, w_k, b_k, w_v, b_v,
-                w_out, eps, rope_theta, n_head, n_kv_head, k_cache, v_cache, donate,
-                attn_sparsity, compress_cache, comp_config):
-        """Multi-head attention (decoding phase)."""
-        # decompress weights
-        if w_q.device.device_type == DeviceType.COMPRESSED:
-            w_q = w_q.device.decompress(w_q)
-            w_k = w_k.device.decompress(w_k)
-            w_v = w_v.device.decompress(w_v)
-            w_out = w_out.device.decompress(w_out)
-
-        b, tgt_s, h = inputs.shape
-        src_s = attention_mask.shape[1]
-        head_dim = h // n_head
-        scaling = head_dim ** -0.5
-
-        hidden = rms_norm(inputs.data, weight=w_ln.data, eps=eps)
-
-        # shape: (b, 1, h)
-        q = F.linear(hidden, w_q.data, b_q.data) * scaling
-        k = F.linear(hidden, w_k.data, b_k.data)
-        v = F.linear(hidden, w_v.data, b_v.data)
-        # shape: (b, 1, n_head, head_dim)
-        q = q.view(b, tgt_s, n_head, head_dim)
-        k = k.view(b, tgt_s, n_kv_head, head_dim)
-        v = v.view(b, tgt_s, n_kv_head, head_dim)
-
-        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
-        cos, sin = rotary_embedding(v, inv_freq, seq_len=position_ids.max().item() + 1)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
-
-        n_kv_groups = n_head // n_kv_head
-        k = repeat_kv(k, n_kv_groups)
-        v = repeat_kv(v, n_kv_groups)
-
-        # shape: (b * n_head, 1, head_dim)
-        q = q.permute(0, 2, 1, 3).reshape(b * n_head, tgt_s, head_dim)
-        # shape: (1, b * n_head, head_dim)
-        k_new = k.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
-        # shape: (1, b * n_head, head_dim)
-        v_new = v.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
-
-        if isinstance(k_cache, TorchTensor):
-            if attn_sparsity >= 1.0:  # Dense attention
-                if compress_cache:
-                    # shape: (s, b * n_head, head_dim)
-                    k = k_cache.device.decompress(k_cache)[:src_s]
-                    v = v_cache.device.decompress(v_cache)[:src_s]
-                else:
-                    # shape: (s, b * n_head, head_dim)
-                    k = k_cache.data[:src_s]
-                    v = v_cache.data[:src_s]
-                k[src_s - 1:src_s] = k_new
-                v[src_s - 1:src_s] = v_new
-
-                # shape: (b * n_head, head_dim, s)
-                k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
-                # shape: (b * n_head, s, head_dim)
-                v = v.permute(1, 0, 2).reshape(b * n_head, src_s, head_dim)
-
-                if k.is_cuda:
-                    value = self._attention_value(q, k, v, attention_mask.data,
-                        b, src_s, tgt_s, n_head, head_dim)
-                else:
-                    q = q.float().cpu()
-                    k, v = k.float(), v.float()
-                    value = self._attention_value(q, k, v, attention_mask.data,
-                        b, src_s, tgt_s, n_head, head_dim).cuda().half()
-            else:  # Sparse attention
-                # shape: (s, b * n_head, head_dim)
-                k = k_cache.data[:src_s]
-                k[src_s - 1:src_s] = k_new
-                # shape: (b * n_head, head_dim, s)
-                k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
-
-                if k.is_cuda:
-                    value = self._sparse_attention_value(q, k, v_new, v_cache,
-                        attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
-                        attn_sparsity)
-                else:
-                    q = q.float().cpu()
-                    value = self._sparse_attention_value(q, k, v_new, v_cache,
-                        attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
-                        attn_sparsity).cuda().half()
-        else:  # Mixed device attention
-            assert attn_sparsity >= 1.0
-            value = self._mixed_device_attention(q, k_cache, v_cache,
-                k_new, v_new, attention_mask.data, b, src_s, tgt_s,
-                n_head, head_dim)
-
-        # shape: (b, 1, h)
-        value = value.transpose(1, 2).view(b, tgt_s, h)
-        value = F.linear(value, w_out.data)
-
-        value.add_(inputs.data)
-
-        if donate[0]: inputs.delete()
-        if donate[1]: attention_mask.delete()
-
-        if compress_cache:
-            if comp_config.group_dim == 0:
-                s_ = src_s // comp_config.group_size * comp_config.group_size
-                k_new = k[:, :, s_:].permute(2, 0, 1)
-                v_new = v[:, s_:, :].permute(1, 0, 2)
-            k_new = self.compressed_device.compress(k_new, comp_config)
-            v_new = self.compressed_device.compress(v_new, comp_config)
-        else:
-            k_new = TorchTensor.create_from_torch(k_new, self)
-            v_new = TorchTensor.create_from_torch(v_new, self)
-
-        return TorchTensor.create_from_torch(value, self), k_new, v_new    
