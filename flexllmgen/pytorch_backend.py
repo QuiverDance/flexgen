@@ -905,6 +905,7 @@ def copy_worker_func(queue, cuda_id):
 
             queue.task_done()
 
+# this codes were based on: PR#135 https://github.com/FMInference/FlexLLMGen/pull/135
 # For Llama
 
 def rms_norm(input, weight, eps) -> torch.Tensor:

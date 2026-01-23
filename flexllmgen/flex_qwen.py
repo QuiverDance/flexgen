@@ -1,3 +1,5 @@
+#this codes were based on: PR#135 https://github.com/FMInference/FlexLLMGen/pull/135
+
 """
 Usage:
 python3 -m flexgen.flex_qwen --model Qwen/Qwen1.5-0.5B-Chat --gpu-batch-size 32 --percent 100 0 100 0 100 0

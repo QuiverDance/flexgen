@@ -2,6 +2,8 @@
 The Llama model configurations and weight downloading utilities.
 
 adopted from opt_config.py
+
+#this codes were based on: PR#135 https://github.com/FMInference/FlexLLMGen/pull/135
 """
 
 import dataclasses
