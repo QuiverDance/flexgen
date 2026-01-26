@@ -98,6 +98,12 @@ class LlamaConfig:
     def cache_bytes(self, batch_size, seq_len):
         bytes_per_element = 2  # float16
         return 2 * batch_size * seq_len * self.num_hidden_layers * self.input_dim * bytes_per_element
+    
+        # for RoPE caching (if implemented)
+        # head_dim = self.input_dim // self.n_head
+        # kv_dim = self.num_key_value_heads * head_dim
+        # bytes_per_element = np.dtype(self.dtype).itemsize  # fp16/bf16=2
+        # return batch_size * seq_len * self.num_hidden_layers * kv_dim * 2 * bytes_per_element
 
     def hidden_bytes(self, batch_size, seq_len):
         bytes_per_element = 2  # float16
@@ -216,5 +222,16 @@ def download_llama_weights(model_name, path, hf_token):
         for name, param in tqdm(state.items(), leave=False):
             name = name.replace("model.", "")
             param_path = os.path.join(out_dir, name)
-            with open(param_path, "wb") as f:
-                np.save(f, param.detach().cpu().numpy())
+            t = param.detach().cpu().contiguous()
+            if t.dtype == torch.bfloat16:
+                # Save exact bf16 bits as uint16 (numpy compatible)
+                arr = t.view(torch.uint16).numpy()
+                with open(param_path, "wb") as f:
+                    np.save(f, arr)
+                with open(param_path + ".dtype", "w") as f:
+                    f.write("bfloat16")
+            else:
+                with open(param_path, "wb") as f:
+                    np.save(f, t.numpy())
+                with open(param_path + ".dtype", "w") as f:
+                    f.write(str(t.dtype).replace("torch.", ""))
