@@ -2,20 +2,20 @@
 
 """
 Usage:
-python3 -m flexgen.flex_llama --model meta-llama/Llama-2-7b-chat-hf --gpu-batch-size 32 --percent 100 0 100 0 100 0
+python3 -m flexllmgen.flex_llama --model meta-llama/Llama-3.1-8B --gpu-batch-size 32 --percent 100 0 100 0 100 0
 """
 import os
 import torch
 import argparse
 from typing import Union
 from transformers import AutoTokenizer
-from flexgen.compression import CompressionConfig
-from flexgen.llama_config import LlamaConfig, get_llama_config, download_llama_weights
-from flexgen.pytorch_backend import LlamaTorchDevice, TorchDisk, TorchMixedDevice, fix_recursive_import
-from flexgen.flex_opt import (Policy, init_weight_list, InputEmbed, OutputEmbed, SelfAttention, MLP,
+from flexllmgen.compression import CompressionConfig
+from flexllmgen.llama_config import LlamaConfig, get_llama_config, download_llama_weights
+from flexllmgen.pytorch_backend import LlamaTorchDevice, TorchDisk, TorchMixedDevice, fix_recursive_import
+from flexllmgen.flex_opt import (Policy, init_weight_list, InputEmbed, OutputEmbed, SelfAttention, MLP,
                               TransformerLayer, OptLM, get_filename, get_test_inputs)
-from flexgen.timer import timers
-from flexgen.utils import (ExecutionEnv, GB, ValueHolder,
+from flexllmgen.timer import timers
+from flexllmgen.utils import (ExecutionEnv, GB, ValueHolder,
     array_1d, array_2d, str2bool, project_decode_latency, write_benchmark_log)
 
 fix_recursive_import()
@@ -121,8 +121,6 @@ class LlamaSelfAttention(SelfAttention):
             ((n_kv_head*head_dim, h), dtype, path + "self_attn.k_proj.weight"),
             # w_v
             ((n_kv_head*head_dim, h), dtype, path + "self_attn.v_proj.weight"),
-            # w_re
-            ((head_dim//2,), dtype, path + "self_attn.rotary_emb.inv_freq"),
             # w_o
             ((n_head*head_dim, h), dtype, path + "self_attn.o_proj.weight"),
         ]
@@ -130,7 +128,7 @@ class LlamaSelfAttention(SelfAttention):
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
-        w_ln, w_q, w_k, w_v, w_re, w_o = weight_home.val
+        w_ln, w_q, w_k, w_v, w_o = weight_home.val
         if k == 0:
             dst1 = self.weight_load_dst
             dst2 = self.compute
@@ -139,7 +137,6 @@ class LlamaSelfAttention(SelfAttention):
                 w_q.smart_copy(dst1),
                 w_k.smart_copy(dst1),
                 w_v.smart_copy(dst1),
-                w_re.smart_copy(dst1),
                 w_o.smart_copy(dst1)))
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
@@ -153,17 +150,18 @@ class LlamaSelfAttention(SelfAttention):
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             ((w_ln, donate[2]), (w_q, donate[3]), (w_k, donate[4]), (w_v, donate[5]),
-             (w_re, donate[6]), (w_o, donate[7])) = weight_read_buf.pop()
+             (w_o, donate[6])) = weight_read_buf.pop()
         else:
             ((w_ln, _), (w_q, _), (w_k, _), (w_v, _),
-             (w_re, _), (w_o, _)) = weight_read_buf.val
+             (w_o, _)) = weight_read_buf.val
 
         if i == 0:  # prefill
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
             position_ids = torch.cumsum(mask.data, dim=1).int() * mask.data + 1
             h, new_k_cache, new_v_cache = self.compute.llama_mha(h, position_ids, mask, w_ln,
-                w_q, w_k, w_v, w_re, w_o, n_head, n_kv_head, donate, self.config.rms_norm_eps,
-                self.policy.compress_cache, self.policy.comp_cache_config)
+                w_q, w_k, w_v, w_o, n_head, n_kv_head, donate, self.config.rms_norm_eps,
+                self.policy.compress_cache, self.policy.comp_cache_config,
+                self.config.rope_theta, self.config.rope_scaling)
             cache_write_buf.store((new_k_cache, new_v_cache))
         else:  # decoding
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
@@ -171,9 +169,10 @@ class LlamaSelfAttention(SelfAttention):
             position_ids = torch.cumsum(mask.data, dim=1).int() * mask.data + 1
             position_ids = position_ids[:, -h.shape[1]].unsqueeze(1)
             h, new_k_cache, new_v_cache = self.compute.llama_mha_gen(h, position_ids, mask, w_ln,
-                w_q, w_k, w_v, w_re, w_o, self.config.rms_norm_eps, n_head, n_kv_head,
+                w_q, w_k, w_v, w_o, self.config.rms_norm_eps, n_head, n_kv_head,
                 k_cache, v_cache, donate, self.policy.attn_sparsity,
-                self.policy.compress_cache, self.policy.comp_cache_config)
+                self.policy.compress_cache, self.policy.comp_cache_config,
+                self.config.rope_theta, self.config.rope_scaling)
             cache_write_buf.store((new_k_cache, new_v_cache))
 
         hidden.val = h
