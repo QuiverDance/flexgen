@@ -968,13 +968,13 @@ def build_llama_inv_freq(head_dim, rope_theta, rope_scaling, device) -> torch.Te
     low_freq_wave_length = original_max_position_embeddings / low_freq_factor
     high_freq_wave_length = original_max_position_embeddings / high_freq_factor
 
-    inv_freq_scaled = torch.where(wave_length > low_freq_wave_length, inv_freq / factor, inv_freq)
+    inv_freq_llama = torch.where(wave_length > low_freq_wave_length, inv_freq / factor, inv_freq)
 
     smooth_factor = (original_max_position_embeddings / wave_length - low_freq_factor) / (high_freq_factor - low_freq_factor)
-    smoothed = (1.0 - smooth_factor) * (inv_freq_scaled / factor) + smooth_factor * inv_freq_scaled
+    smoothed = (1.0 - smooth_factor) * (inv_freq_llama / factor) + smooth_factor * inv_freq_llama
 
     is_medium = (~(wave_length < high_freq_wave_length)) & (~(wave_length > low_freq_wave_length))
-    inv_freq = torch.where(is_medium, smoothed, inv_freq_scaled)
+    inv_freq = torch.where(is_medium, smoothed, inv_freq_llama)
     return inv_freq
 
 def rotary_embedding_from_position_ids(x, inv_freq, position_ids, attention_scaling):
@@ -1050,7 +1050,7 @@ def apply_rotary_pos_emb_no_ids(q, k, cos, sin, unsqueeze_dim=2):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
-    cos = cos.unsqueeze(unsqueeze_dim)
+    cos = cos.unsqueeze(unsqueeze_dim)              # [b, s, head_dim] -> [b, s, 1, head_dim]
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
