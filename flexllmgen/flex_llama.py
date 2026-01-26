@@ -158,15 +158,9 @@ class LlamaSelfAttention(SelfAttention):
         if i == 0:  # prefill
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
 
-            m = mask.data  # torch.Tensor, shape [b, s], dtype=bool
-
-            # m = mask.data
-            # print("[prefill] shape_len:", m.shape[1], "valid_len:", int(m.sum().item()),
-            #     "true_idx:", m[0].nonzero(as_tuple=True)[0][:20].tolist(), "...", m[0].nonzero(as_tuple=True)[0][-20:].tolist())
-
-            b, s = mask.data.shape
-            position_ids = torch.arange(s, device=mask.data.device).unsqueeze(0).expand(b, s).int()
-            h, new_k_cache, new_v_cache = self.compute.llama_mha(h, position_ids, mask, w_ln,
+            position_ids = torch.cumsum(mask.data, dim=1).int() - 1
+            position_ids = torch.where(mask.data, position_ids, torch.zeros_like(position_ids))
+            h, new_k_cache, new_v_cache = self.compute.llama_gqa(h, position_ids, mask, w_ln,
                 w_q, w_k, w_v, w_o, n_head, n_kv_head, donate, self.config.rms_norm_eps,
                 self.policy.compress_cache, self.policy.comp_cache_config,
                 self.config.rope_theta, self.config.rope_scaling)
@@ -175,16 +169,10 @@ class LlamaSelfAttention(SelfAttention):
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[8]), (v_cache, donate[9]) = cache_read_buf.pop()
             
-            b, s = mask.data.shape
-            position_ids = torch.full((b, 1), mask.shape[1] - 1, device=mask.data.device, dtype=torch.int32)
-
-            # m = mask.data
-            # valid_len = int(m.sum(dim=1).max().item())
-            # print("[decode] shape_len:", m.shape[1], "valid_len:", valid_len, "true_last:", int(m[0].nonzero(as_tuple=True)[0][-1].item()))
-            # print("[decode] position_ids:", position_ids.detach().cpu().tolist())
-
-            # position_ids = position_ids[:, -h.shape[1]].unsqueeze(1)
-            h, new_k_cache, new_v_cache = self.compute.llama_mha_gen(h, position_ids, mask, w_ln,
+            position_ids = torch.cumsum(mask.data, dim=1).int() - 1
+            position_ids = torch.where(mask.data, position_ids, torch.zeros_like(position_ids))
+            position_ids = position_ids[:, -1].unsqueeze(1)
+            h, new_k_cache, new_v_cache = self.compute.llama_gqa_gen(h, position_ids, mask, w_ln,
                 w_q, w_k, w_v, w_o, self.config.rms_norm_eps, n_head, n_kv_head,
                 k_cache, v_cache, donate, self.policy.attn_sparsity,
                 self.policy.compress_cache, self.policy.comp_cache_config,
@@ -318,8 +306,10 @@ class LlamaLM(OptLM):
 
 def run_flexgen(args):
     print(f"<run_flexgen>: args.model: {args.model}")
+    llama_config = get_llama_config(args.model, hf_token=args.hf_token)
+
     tokenizer = AutoTokenizer.from_pretrained(args.model, token=args.hf_token, padding_side="left")
-    tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.pad_token_id = llama_config.pad_token_id
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
     # Task and policy
@@ -345,7 +335,6 @@ def run_flexgen(args):
                                       group_dim=2, symmetric=False))
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
-    llama_config = get_llama_config(args.model, hf_token=args.hf_token)
     cache_size = llama_config.cache_bytes(num_prompts, prompt_len + gen_len)
     hidden_size = llama_config.hidden_bytes(num_prompts, prompt_len + gen_len)
     print(f"model size: {llama_config.model_bytes()/GB:.3f} GB, "
