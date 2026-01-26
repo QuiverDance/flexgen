@@ -122,20 +122,28 @@ class TorchTensor:
     def load_from_np_file(self, filename):
         if self.device.device_type == DeviceType.DISK:
             shutil.copy(filename, self.data)
+            if os.path.exists(dtype_path):
+                shutil.copy(dtype_path, self.data + ".dtype")
+            return
         else:
             np_array = np.load(filename, allow_pickle=False)
 
             dtype_path = filename + ".dtype"
             if os.path.exists(dtype_path):
                 with open(dtype_path, "r") as f:
-                    dtype_str = f.read().strip()
+                    dtype_str = f.read().strip().lower()
 
-                if dtype_str == "bffloat16":
+                if dtype_str in ("bfloat16", "bf16"):
                     # stored as uint16 bits -> restore exact bf16 tensor
-                    t = torch.from_numpy(np_array).view(torch.bfloat16)
+                    t = torch.from_numpy(np_array)
+                    if t.dtype != torch.uint16:
+                        t = t.to(torch.uint16)
+                    t = t.view(torch.bfloat16)
+
+                    # fp16 path for compressed tensor
                     if self.device.device_type == DeviceType.COMPRESSED:
-                        tmp = global_cpu_device.compressed_device.compress(
-                            t, self.data[2])
+                        t_fp16 = t.to(torch.float16)
+                        tmp = global_cpu_device.compressed_device.compress(t_fp16, self.data[2])
                         general_copy(self, None, tmp, None)
                     else:
                         self.data.copy_(t)
@@ -683,6 +691,9 @@ class TorchDisk:
     def delete(self, tensor):
         if os.path.exists(tensor.data) and tensor.delete_file:
             os.remove(tensor.data)
+            dtype_path = tensor.data + ".dtype"
+            if os.path.exists(dtype_path) and tensor.delete_file:
+                os.remove(dtype_path)
 
     def init_cache_one_gpu_batch(self, config, task, policy):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
@@ -885,7 +896,12 @@ def cut_indices(indices, start, stop, base=0):
 
 def map_to_torch_tensor(tensor, indices):
     if tensor.device.device_type == DeviceType.DISK:
-        data = torch.from_numpy(np.lib.format.open_memmap(tensor.data))
+        dtype_path = tensor.data + ".dtype"
+        if os.path.exists(dtype_path):
+            with open(dtype_path, "r") as f:
+                ds = f.read().strip().lower()
+            if ds in ("bfloat16", "bf16"):
+                data = data.view(torch.bfloat16)
     else:
         data = tensor.data
 
@@ -1085,6 +1101,7 @@ class LlamaTorchDevice(TorchDevice):
         return TorchTensor.create_from_torch(token_embed, self)
 
     def llama_output_embed(self, inputs, w_ln, w_token, eps, donate, do_sample, temperature):
+
         # decompress weights
         if w_token.device.device_type == DeviceType.COMPRESSED:
             w_token = w_token.device.decompress(w_token)
@@ -1123,6 +1140,7 @@ class LlamaTorchDevice(TorchDevice):
         q = F.linear(hidden, w_q.data) * scaling
         k = F.linear(hidden, w_k.data)
         v = F.linear(hidden, w_v.data)
+
         # shape: (b, s, n_head, head_dim)
         q = q.view(b, s, n_head, head_dim)
         k = k.view(b, s, n_kv_head, head_dim)
