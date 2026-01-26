@@ -96,14 +96,11 @@ class LlamaConfig:
         return total_elems * bytes_per_element
 
     def cache_bytes(self, batch_size, seq_len):
-        bytes_per_element = 2  # float16
-        return 2 * batch_size * seq_len * self.num_hidden_layers * self.input_dim * bytes_per_element
-    
         # for RoPE caching (if implemented)
-        # head_dim = self.input_dim // self.n_head
-        # kv_dim = self.num_key_value_heads * head_dim
-        # bytes_per_element = np.dtype(self.dtype).itemsize  # fp16/bf16=2
-        # return batch_size * seq_len * self.num_hidden_layers * kv_dim * 2 * bytes_per_element
+        head_dim = self.input_dim // self.n_head
+        kv_dim = self.num_key_value_heads * head_dim
+        bytes_per_element = 2  # float16
+        return batch_size * seq_len * self.num_hidden_layers * kv_dim * 2 * bytes_per_element
 
     def hidden_bytes(self, batch_size, seq_len):
         bytes_per_element = 2  # float16
