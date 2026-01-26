@@ -2,6 +2,7 @@
 from enum import Enum, auto
 from functools import partial
 from itertools import count
+import math
 import os
 import queue
 import shutil
@@ -122,7 +123,26 @@ class TorchTensor:
         if self.device.device_type == DeviceType.DISK:
             shutil.copy(filename, self.data)
         else:
-            self.load_from_np(np.load(filename))
+            np_array = np.load(filename, allow_pickle=False)
+
+            dtype_path = filename + ".dtype"
+            if os.path.exists(dtype_path):
+                with open(dtype_path, "r") as f:
+                    dtype_str = f.read().strip()
+
+                if dtype_str == "bffloat16":
+                    # stored as uint16 bits -> restore exact bf16 tensor
+                    t = torch.from_numpy(np_array).view(torch.bfloat16)
+                    if self.device.device_type == DeviceType.COMPRESSED:
+                        tmp = global_cpu_device.compressed_device.compress(
+                            t, self.data[2])
+                        general_copy(self, None, tmp, None)
+                    else:
+                        self.data.copy_(t)
+                    return
+                
+            # default path
+            self.load_from_np(np_array)
 
     def copy(self, dst, src_indices=None):
         if src_indices:
@@ -925,6 +945,59 @@ def rotary_embedding(x, inv_freq, seq_len):
         emb.sin().to(x.dtype)[:seq_len].to(dtype=x.dtype),
     )
 
+def build_llama_inv_freq(head_dim, rope_theta, rope_scaling, device) -> torch.Tensor:
+    """
+    Build the inverse frequency for LLaMA rotary embedding.
+    inv_freq: [head_dim/2] (base)
+    rope_scaling keys:
+      - factor
+      - low_freq_factor
+      - high_freq_factor
+      - original_max_position_embeddings
+      - rope_type == "llama3"
+    """
+    inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
+
+    factor = float(rope_scaling.get("factor", 8.0))
+    low_freq_factor = float(rope_scaling.get("low_freq_factor", 1.0))
+    high_freq_factor = float(rope_scaling.get("high_freq_factor", 4.0))
+    original_max_position_embeddings = int(rope_scaling.get("original_max_position_embeddings", 8192))
+    
+    wave_length = 2 * math.pi / inv_freq
+
+    low_freq_wave_length = original_max_position_embeddings / low_freq_factor
+    high_freq_wave_length = original_max_position_embeddings / high_freq_factor
+
+    inv_freq_scaled = torch.where(wave_length > low_freq_wave_length, inv_freq / factor, inv_freq)
+
+    smooth_factor = (original_max_position_embeddings / wave_length - low_freq_factor) / (high_freq_factor - low_freq_factor)
+    smoothed = (1.0 - smooth_factor) * (inv_freq_scaled / factor) + smooth_factor * inv_freq_scaled
+
+    is_medium = (~(wave_length < high_freq_wave_length)) & (~(wave_length > low_freq_wave_length))
+    inv_freq = torch.where(is_medium, smoothed, inv_freq_scaled)
+    return inv_freq
+
+def rotary_embedding_from_position_ids(x, inv_freq, position_ids, attention_scaling):
+    """Generates Rotary Position Embedding from position ids.
+    Args:
+        x (`torch.Tensor`): The input tensor to be used to determine the device and dtype.
+        inv_freq (`torch.Tensor`): The inverse frequency tensor.
+        position_ids (`torch.Tensor`): The position indices of the tokens.
+        attention_scaling (`float`): The attention scaling factor.
+    """
+    inv = inv_freq.to(x.device, torch.float32)                      # [head_dim/2]
+    pos = position_ids.to(x.device, torch.float32)                  # [b, s]
+
+    inv_expanded = inv[None, :, None].expand(pos.shape[0], -1, 1)   # [b, head_dim/2, 1]
+    pos_expanded = pos[:, None, :]                                  # [b, 1, s]
+
+    with torch.autocast(device_type=x.device.type, enabled=False):  
+        freqs = (inv_expanded @ pos_expanded).transpose(1, 2)       # [b, s, head_dim/2]
+        emb = torch.cat((freqs, freqs), dim=-1)                     # [b, s, head_dim]
+        cos = emb.cos() * attention_scaling
+        sin = emb.sin() * attention_scaling
+
+    return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -959,6 +1032,29 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=2):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
+def apply_rotary_pos_emb_no_ids(q, k, cos, sin, unsqueeze_dim=2):
+    """Applies Rotary Position Embedding to the query and key tensors.
+
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
@@ -1007,15 +1103,14 @@ class LlamaTorchDevice(TorchDevice):
             ids = last_token_logits.argmax(dim=1, keepdim=True)
         return TorchTensor.create_from_torch(ids, self)
 
-    def llama_mha(self, inputs, position_ids, attention_mask, w_ln, w_q, w_k, w_v,
-            w_re, w_out, n_head, n_kv_head, donate, eps, compress_cache, comp_config):
+    def llama_mha(self, inputs, position_ids, attention_mask, w_ln, w_q, w_k, w_v, w_out
+                  , n_head, n_kv_head, donate, eps, compress_cache, comp_config, rope_theta, rope_scaling):
         """Multi-head attention (prefill phase)."""
         # decompress weights
         if w_q.device.device_type == DeviceType.COMPRESSED:
             w_q = w_q.device.decompress(w_q)
             w_k = w_k.device.decompress(w_k)
             w_v = w_v.device.decompress(w_v)
-            w_re = w_re.device.decompress(w_re)
             w_out = w_out.device.decompress(w_out)
 
         b, s, h = inputs.shape
@@ -1033,9 +1128,13 @@ class LlamaTorchDevice(TorchDevice):
         k = k.view(b, s, n_kv_head, head_dim)
         v = v.view(b, s, n_kv_head, head_dim)
 
-        kv_seq_len = k.shape[-3]
-        cos, sin = rotary_embedding(v, w_re.data, seq_len=kv_seq_len)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+        # kv_seq_len = k.shape[-3]
+        # cos, sin = rotary_embedding(v, w_re.data, seq_len=kv_seq_len)
+        # q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+
+        inv_freq = build_llama_inv_freq(head_dim, float(rope_theta), rope_scaling, v.device)
+        cos, sin = rotary_embedding_from_position_ids(v, inv_freq, position_ids, 1.0)
+        q, k = apply_rotary_pos_emb_no_ids(q, k, cos, sin, unsqueeze_dim=2)
 
         n_kv_groups = n_head // n_kv_head
         k = repeat_kv(k, n_kv_groups)
@@ -1085,16 +1184,15 @@ class LlamaTorchDevice(TorchDevice):
 
         return TorchTensor.create_from_torch(value, self), k, v
 
-    def llama_mha_gen(self, inputs, position_ids, attention_mask, w_ln, w_q, w_k, w_v,
-                w_re, w_out, eps, n_head, n_kv_head, k_cache, v_cache, donate,
-                attn_sparsity, compress_cache, comp_config):
+    def llama_mha_gen(self, inputs, position_ids, attention_mask, w_ln, w_q, w_k, w_v, w_out,
+                      eps, n_head, n_kv_head, k_cache, v_cache, donate,
+                      attn_sparsity, compress_cache, comp_config, rope_theta, rope_scaling):
         """Multi-head attention (decoding phase)."""
         # decompress weights
         if w_q.device.device_type == DeviceType.COMPRESSED:
             w_q = w_q.device.decompress(w_q)
             w_k = w_k.device.decompress(w_k)
             w_v = w_v.device.decompress(w_v)
-            w_re = w_re.device.decompress(w_re)
             w_out = w_out.device.decompress(w_out)
 
         b, tgt_s, h = inputs.shape
@@ -1113,8 +1211,11 @@ class LlamaTorchDevice(TorchDevice):
         k = k.view(b, tgt_s, n_kv_head, head_dim)
         v = v.view(b, tgt_s, n_kv_head, head_dim)
 
-        cos, sin = rotary_embedding(v, w_re.data, seq_len=position_ids.max().item() + 1)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+        # cos, sin = rotary_embedding(v, w_re.data, seq_len=position_ids.max().item() + 1)
+        # q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+        inv_freq = build_llama_inv_freq(head_dim, float(rope_theta), rope_scaling, v.device)
+        cos, sin = rotary_embedding_from_position_ids(v, inv_freq, position_ids, 1.0)
+        q, k = apply_rotary_pos_emb_no_ids(q, k, cos, sin, unsqueeze_dim=2)
 
         n_kv_groups = n_head // n_kv_head
         k = repeat_kv(k, n_kv_groups)
