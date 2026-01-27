@@ -773,14 +773,15 @@ class TorchMixedDevice:
             policy.gpu_batch_size)
         shape = (prompt_len + gen_len - 1, gpu_batch_size * config.num_key_value_heads, hidden_size // num_head)
 
-        # We have to round to a multiple of `num_head`
+        # Rount to a multiple of num_key_value_heads
+        round_base = config.num_key_value_heads
         if policy.cache_disk_percent == 0:
-            len_gpu = int(shape[SEG_DIM] * policy.cache_gpu_percent / 100) // num_head * num_head
+            len_gpu = int(shape[SEG_DIM] * policy.cache_gpu_percent / 100) // round_base * round_base
             len_cpu = shape[SEG_DIM]  - len_gpu
             len_disk = 0
         else:
-            len_gpu = int(shape[SEG_DIM] * policy.cache_gpu_percent / 100) // num_head * num_head
-            len_cpu = int(shape[SEG_DIM] * policy.cache_cpu_percent / 100) // num_head * num_head
+            len_gpu = int(shape[SEG_DIM] * policy.cache_gpu_percent / 100) // round_base * round_base
+            len_cpu = int(shape[SEG_DIM] * policy.cache_cpu_percent / 100) // round_base * round_base
             len_disk = shape[SEG_DIM] - len_gpu - len_cpu
         lens = [len_gpu, len_cpu, len_disk]
 
@@ -1147,6 +1148,100 @@ class LlamaTorchDevice(TorchDevice):
             ids = last_token_logits.argmax(dim=1, keepdim=True)
         return TorchTensor.create_from_torch(ids, self)
 
+    def _mixed_device_attention_gqa(self, q, k_cache, v_cache, k_new, v_new, 
+                                    mask, b, src_s, tgt_s, n_head, n_kv_head, head_dim):
+        """Mixed-device dense attention for GQA decoding."""
+        # Segment tensors (TorchTensor) -> primitive torch.Tensor
+        k_gpu, k_cpu = k_cache[0].data, k_cache[1].data
+        v_gpu, v_cpu = v_cache[0].data, v_cache[1].data
+
+        seg = k_gpu.shape[1]  # number of (batch, kv_head) entries on GPU
+        assert seg % n_kv_head == 0, (f"GQA mixed cache GPU segment len={seg} must be a multiple of n_kv_head={n_kv_head}")
+        b_gpu = seg // n_kv_head
+        b_cpu = b - b_gpu
+        n_kv_groups = n_head // n_kv_head
+
+        def _build_kv_dimension(k_flat, v_flat, b_part):
+            # k_flat/v_flat: (src_s, b_part*n_kv_head, head_dim)
+            k5 = (k_flat.permute(1, 2, 0).contiguous().view(b_part, n_kv_head, head_dim, src_s).unsqueeze(2))  # (b, n_kv_head, 1, head_dim, src_s)
+            v5 = (v_flat.permute(1, 0, 2).contiguous().view(b_part, n_kv_head, src_s, head_dim).unsqueeze(2))  # (b, n_kv_head, 1, src_s, head_dim)
+            return k5, v5
+
+        values = []
+
+        # GPU part (first b_gpu batches)
+        if b_gpu > 0:
+            q_gpu = q[:b_gpu]
+            # shape: (s, b * n_head, head_dim)
+            k_gpu = k_gpu[:src_s, :seg, :]
+            v_gpu = v_gpu[:src_s, :seg, :]
+            # Update last token (supports cross-device copy if needed)
+            k_gpu[src_s - 1:src_s].copy_(k_new[:, :seg, :])
+            v_gpu[src_s - 1:src_s].copy_(v_new[:, :seg, :])
+
+            k_gpu, v_gpu = _build_kv_dimension(k_gpu, v_gpu, b_gpu)
+
+            # q_gpu: (b, n_kv_head, n_kv_groups, tgt_s, head_dim)
+            # k_gpu: (b, n_kv_head, 1, head_dim, src_s)
+            attn_weights = torch.matmul(q_gpu, k_gpu)  # (b, n_kv_head, n_kv_groups, tgt_s, src_s)
+            mask_gpu = mask[:b_gpu].view(b_gpu, 1, 1, 1, src_s)
+            if mask_gpu.device != attn_weights.device:
+                mask_gpu = mask_gpu.to(attn_weights.device)
+
+            attn_weights = torch.where(mask_gpu, attn_weights, -1e4)
+            attn_weights = F.softmax(attn_weights, dim=-1)
+
+            value_gpu = torch.matmul(attn_weights, v_gpu).contiguous().view(b_gpu, n_head, tgt_s, head_dim)
+            values.append(value_gpu)
+
+        # CPU part (remaining b_cpu batches)
+        if b_cpu > 0:
+            total = b * n_kv_head
+            cpu_len = k_cpu.shape[1]
+
+            # Two possible layouts:
+            # (1) CPU cache stores the full flattened dim (same as `total`) and we slice [seg:].
+            # (2) CPU cache stores only the tail segment (length == total - seg).
+            if cpu_len == total:
+                k_cpu = k_cpu[:src_s, seg:total, :]
+                v_cpu = v_cpu[:src_s, seg:total, :]
+                k_new_cpu = k_new[:, seg:total, :]
+                v_new_cpu = v_new[:, seg:total, :]
+            elif seg + cpu_len == total:
+                k_cpu = k_cpu[:src_s, :, :]
+                v_cpu = v_cpu[:src_s, :, :]
+                k_new_cpu = k_new[:, seg:seg + cpu_len, :]
+                v_new_cpu = v_new[:, seg:seg + cpu_len, :]
+            else:
+                raise AssertionError(
+                    f"Unexpected mixed-cache layout: seg={seg}, cpu_len={cpu_len}, total={total}")
+
+            # Update last token (supports cross-device copy if needed)
+            k_cpu[src_s - 1:src_s].copy_(k_new_cpu)
+            v_cpu[src_s - 1:src_s].copy_(v_new_cpu)
+
+            # Compute on CPU in fp32 for stability
+            q_cpu = q[b_gpu:].float().cpu()
+            k_cpu = k_cpu.float().cpu()
+            v_cpu = v_cpu.float().cpu()
+
+            k_cpu, v_cpu = _build_kv_dimension(k_cpu, v_cpu, b_cpu)
+
+            attn_weights = torch.matmul(q_cpu, k_cpu)
+            mask_cpu = mask[b_gpu:].view(b_cpu, 1, 1, 1, src_s)
+            if mask_cpu.is_cuda:
+                mask_cpu = mask_cpu.cpu()
+
+            attn_weights = torch.where(mask_cpu, attn_weights, -1e4)
+            attn_weights = F.softmax(attn_weights, dim=-1)
+
+            value_cpu = torch.matmul(attn_weights, v_cpu).contiguous().view(b_cpu, n_head, tgt_s, head_dim).cuda().half()
+            values.append(value_cpu)
+
+        if len(values) == 1:
+            return values[0]
+        return torch.cat(values, dim=0)
+
     def llama_gqa(self, inputs, position_ids, attention_mask, w_ln, w_q, w_k, w_v, w_out
                   , n_head, n_kv_head, donate, eps, compress_cache, comp_config, rope_theta, rope_scaling):
         """Grouped Query Attention (prefill phase)."""
@@ -1266,6 +1361,7 @@ class LlamaTorchDevice(TorchDevice):
         v_new = v.permute(1, 0, 2, 3).contiguous().view(tgt_s, b * n_kv_head, head_dim)
 
         if isinstance(k_cache, TorchTensor):
+            print("Llama GQA gen: single device attention")
             if attn_sparsity >= 1.0:  # Dense attention
                 if compress_cache:
                     # shape: (s, b * n_kv_head, head_dim)
@@ -1325,8 +1421,9 @@ class LlamaTorchDevice(TorchDevice):
                         attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
                         attn_sparsity).cuda().half()
         else:  # Mixed device attention
+            print("Llama GQA gen: mixed device attention")
             assert attn_sparsity >= 1.0
-            value = self._mixed_device_attention(q, k_cache, v_cache,
+            value = self._mixed_device_attention_gqa(q, k_cache, v_cache,
                 k_new, v_new, attention_mask.data, b, src_s, tgt_s,
                 n_head, head_dim)
 
