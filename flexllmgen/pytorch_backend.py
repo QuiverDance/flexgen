@@ -994,28 +994,6 @@ def build_llama_inv_freq(head_dim, rope_theta, rope_scaling, device) -> torch.Te
     inv_freq = torch.where(is_medium, smoothed, inv_freq_llama)
     return inv_freq
 
-def rotary_embedding_from_position_ids(x, inv_freq, position_ids, attention_scaling):
-    """Generates Rotary Position Embedding from position ids.
-    Args:
-        x (`torch.Tensor`): The input tensor to be used to determine the device and dtype.
-        inv_freq (`torch.Tensor`): The inverse frequency tensor.
-        position_ids (`torch.Tensor`): The position indices of the tokens.
-        attention_scaling (`float`): The attention scaling factor.
-    """
-    inv = inv_freq.to(x.device, torch.float32)                      # [head_dim/2]
-    pos = position_ids.to(x.device, torch.float32)                  # [b, s]
-
-    inv_expanded = inv[None, :, None].expand(pos.shape[0], -1, 1)   # [b, head_dim/2, 1]
-    pos_expanded = pos[:, None, :]                                  # [b, 1, s]
-
-    with torch.autocast(device_type=x.device.type, enabled=False):  
-        freqs = (inv_expanded @ pos_expanded).transpose(1, 2)       # [b, s, head_dim/2]
-        emb = torch.cat((freqs, freqs), dim=-1)                     # [b, s, head_dim]
-        cos = emb.cos() * attention_scaling
-        sin = emb.sin() * attention_scaling
-
-    return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
@@ -1049,30 +1027,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=2):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
-def apply_rotary_pos_emb_no_ids(q, k, cos, sin, unsqueeze_dim=2):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    cos = cos.unsqueeze(unsqueeze_dim)              # [b, s, head_dim] -> [b, s, 1, head_dim]
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -1086,6 +1040,78 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class LlamaTorchDevice(TorchDevice):
+    
+    # =========================
+    # RoPE cache
+    # =========================
+    # _rope_inv_freq_cache: dict
+    #   key: (head_dim, rope_theta, rope_scaling_key, device)
+    #   value: inv_freq tensor
+    
+    # _rope_cos_sin_cache: dict
+    #   key: (inv_key, device, dtype, chunk_size)
+    #   value: {"max_len": max_seq_len, "cos": cos tensor, "sin": sin tensor}
+    _ROPE_TABLE_CHUNK = 2048  # grow tables in chunks to amortize expansion cost
+
+    def _rope_init_caches(self):
+        if not hasattr(self, "_rope_inv_freq_cache"):
+            self._rope_inv_freq_cache = {}
+        if not hasattr(self, "_rope_cos_sin_cache"):
+            self._rope_cos_sin_cache = {}
+
+    @staticmethod
+    def _rope_scaling_to_key(rope_scaling):
+        # rope_scaling is a dict -> stable, hashable key
+        if rope_scaling is None:
+            return None
+        items = []
+        for k, v in rope_scaling.items():
+            if isinstance(v, (int, float)):
+                items.append((k, float(v)))
+            else:
+                items.append((k, str(v)))
+        return tuple(sorted(items))
+
+    @staticmethod
+    def _round_up(x: int, multiple: int) -> int:
+        return ((x + multiple - 1) // multiple) * multiple
+
+    def _get_llama_inv_freq_cached(self, head_dim, rope_theta, rope_scaling, device):
+        """
+        _rope_inv_freq_cache key: (head_dim, rope_theta, rope_scaling_key, device)
+        Return cached inv_freq
+        """
+        self._rope_init_caches()
+        rope_scaling_key = self._rope_scaling_to_key(rope_scaling)
+        key = (int(head_dim), float(rope_theta), rope_scaling_key, str(device))
+        
+        inv = self._rope_inv_freq_cache.get(key)
+        if inv is None or inv.device != device:
+            # fill inv_freq cache
+            inv = build_llama_inv_freq(head_dim, float(rope_theta), rope_scaling, device)
+            self._rope_inv_freq_cache[key] = inv
+
+        return inv, rope_scaling_key
+
+    def _get_llama_cos_sin_cached(self, inv_freq, seq_len, device, dtype, inv_key):
+        """
+        inv_key: (head_dim, rope_theta, rope_scaling_key)
+        _rope_cos_sin_cache key: (inv_key, device, dtype, chunk_size)
+        Return cached (max_seq_len, cos, sin) table
+        """
+        self._rope_init_caches()
+        seq_len = int(seq_len)
+        max_seq_len = self._round_up(seq_len, int(self._ROPE_TABLE_CHUNK))
+        key = (inv_key, str(device), str(dtype), int(self._ROPE_TABLE_CHUNK))
+
+        entry = self._rope_cos_sin_cache.get(key)
+        if entry is None or entry["max_len"] < max_seq_len:
+            # fill or expand cos/sin cache
+            dummy = torch.empty((), device=device, dtype=dtype)
+            cos, sin = rotary_embedding(dummy, inv_freq, max_seq_len)  # [max_seq_len, head_dim]
+            entry = {"max_len": max_seq_len, "cos": cos, "sin": sin}
+            self._rope_cos_sin_cache[key] = entry
+        return entry["cos"], entry["sin"]
 
     def llama_input_embed(self, inputs, attention_mask, w_token, pad_token_id, donate):
         # decompress weights
@@ -1147,9 +1173,10 @@ class LlamaTorchDevice(TorchDevice):
         k = k.view(b, s, n_kv_head, head_dim)
         v = v.view(b, s, n_kv_head, head_dim)
 
-        inv_freq = build_llama_inv_freq(head_dim, float(rope_theta), rope_scaling, v.device)
-        cos, sin = rotary_embedding_from_position_ids(v, inv_freq, position_ids, 1.0)
-        q, k = apply_rotary_pos_emb_no_ids(q, k, cos, sin, unsqueeze_dim=2)
+        inv_freq, rkey = self._get_llama_inv_freq_cached(head_dim, float(rope_theta), rope_scaling, v.device)
+        inv_key = (int(head_dim), float(rope_theta), rkey)
+        cos, sin = self._get_llama_cos_sin_cached(inv_freq, s, v.device, v.dtype, inv_key)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=2)
 
         n_kv_groups = n_head // n_kv_head
 
@@ -1224,9 +1251,10 @@ class LlamaTorchDevice(TorchDevice):
         k = k.view(b, tgt_s, n_kv_head, head_dim)
         v = v.view(b, tgt_s, n_kv_head, head_dim)
 
-        inv_freq = build_llama_inv_freq(head_dim, float(rope_theta), rope_scaling, v.device)
-        cos, sin = rotary_embedding_from_position_ids(v, inv_freq, position_ids, 1.0)
-        q, k = apply_rotary_pos_emb_no_ids(q, k, cos, sin, unsqueeze_dim=2)
+        inv_freq, rkey = self._get_llama_inv_freq_cached(head_dim, float(rope_theta), rope_scaling, v.device)
+        inv_key = (int(head_dim), float(rope_theta), rkey)
+        cos, sin = self._get_llama_cos_sin_cached(inv_freq, src_s, v.device, v.dtype, inv_key)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=2)
 
         n_kv_groups = n_head // n_kv_head
 
