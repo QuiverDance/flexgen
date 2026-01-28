@@ -29,6 +29,12 @@ def fix_recursive_import():
     general_copy_compressed = compression.general_copy_compressed
     TorchCompressedDevice = compression.TorchCompressedDevice
 
+def get_kv_heads(config):
+    kv_head = getattr(config, "num_key_value_heads", None)
+    if kv_head is None or kv_head == 0:
+        kv_head = config.n_head
+
+    return kv_head
 
 class DeviceType(Enum):
     CPU = auto()
@@ -317,7 +323,8 @@ class TorchDevice:
             config.n_head, config.input_dim, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
         
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * config.num_key_value_heads, hidden_size // num_head)
+        kv_head = get_kv_heads(config)
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * kv_head, hidden_size // num_head)
         # NOTE: disable pin_memory due to high memory overhead
         pin_memory = False
         k_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
@@ -700,7 +707,9 @@ class TorchDisk:
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.n_head, config.input_dim, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * config.num_key_value_heads, hidden_size // num_head)
+
+        kv_head = get_kv_heads(config)
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * kv_head, hidden_size // num_head)
         k_cache = self.allocate(shape, np.float16)
         v_cache = self.allocate(shape, np.float16)
         return k_cache, v_cache
@@ -771,10 +780,12 @@ class TorchMixedDevice:
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.n_head, config.input_dim, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * config.num_key_value_heads, hidden_size // num_head)
+
+        kv_head = get_kv_heads(config)
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * kv_head, hidden_size // num_head)
 
         # Rount to a multiple of num_key_value_heads
-        round_base = config.num_key_value_heads
+        round_base = kv_head
         if policy.cache_disk_percent == 0:
             len_gpu = int(shape[SEG_DIM] * policy.cache_gpu_percent / 100) // round_base * round_base
             len_cpu = shape[SEG_DIM]  - len_gpu
