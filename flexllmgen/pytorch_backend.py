@@ -1361,7 +1361,6 @@ class LlamaTorchDevice(TorchDevice):
         v_new = v.permute(1, 0, 2, 3).contiguous().view(tgt_s, b * n_kv_head, head_dim)
 
         if isinstance(k_cache, TorchTensor):
-            print("Llama GQA gen: single device attention")
             if attn_sparsity >= 1.0:  # Dense attention
                 if compress_cache:
                     # shape: (s, b * n_kv_head, head_dim)
@@ -1421,7 +1420,6 @@ class LlamaTorchDevice(TorchDevice):
                         attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
                         attn_sparsity).cuda().half()
         else:  # Mixed device attention
-            print("Llama GQA gen: mixed device attention")
             assert attn_sparsity >= 1.0
             value = self._mixed_device_attention_gqa(q, k_cache, v_cache,
                 k_new, v_new, attention_mask.data, b, src_s, tgt_s,
