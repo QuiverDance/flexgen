@@ -79,7 +79,6 @@ block size는 GPU batch size 와 the number of GPU batches의 곱이다.
 첫 번째 레이어를 위한 가중치를 num_gpu_batches 만큼 준비하고, 첫 번째 배치, 첫 번째 레이어에서 사용할 hidden을 load 한다.
 
 #### 2.Generate
----
 - i: 생성 단계 index
 - j: 레이어 index
 - k: GPU batch index
@@ -90,7 +89,7 @@ block size는 GPU batch size 와 the number of GPU batches의 곱이다.
 - store_cache_stream : 이전 단계의 cache write-back
 
 compute(forward)는 기본 stream에서 실행되고, load/store는 위 stream에서 겹쳐질 수 있다.
----
+
 <img src="https://github.com/QuiverDance/flexgen/blob/readme/docs/generation_loop_overlap_multi_batch_mechanism.png" alt="image" width="750"></img>
 
 #### 3.Epilogue
