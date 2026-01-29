@@ -1416,26 +1416,15 @@ class LlamaTorchDevice(TorchDevice):
                     attn_weights = F.softmax(attn_weights, dim=-1)
                     value = torch.matmul(attn_weights, v).contiguous().view(b, n_head, tgt_s, head_dim).cuda().half()
             else:  # Sparse attention
-                # shape: (s, b * n_head, head_dim)
-                k = k_cache.data[:src_s]
-                k[src_s - 1:src_s] = k_new
-                # shape: (b * n_head, head_dim, s)
-                k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
-
-                if k.is_cuda:
-                    value = self._sparse_attention_value(q, k, v_new, v_cache,
-                        attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
-                        attn_sparsity)
-                else:
-                    q = q.float().cpu()
-                    value = self._sparse_attention_value(q, k, v_new, v_cache,
-                        attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
-                        attn_sparsity).cuda().half()
+                raise NotImplementedError(
+                    "Sparse attention path is not implemented for GQA. "
+                    "Run with --attn-sparsity 1.0 (dense)."
+                )
         else:  # Mixed device attention
             assert attn_sparsity >= 1.0
             value = self._mixed_device_attention_gqa(q, k_cache, v_cache,
                 k_new, v_new, attention_mask.data, b, src_s, tgt_s,
-                n_head, head_dim)
+                n_head, n_kv_head, head_dim)
 
         # shape: (b, 1, h)
         value = value.transpose(1, 2).view(b, tgt_s, h)
