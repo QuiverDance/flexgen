@@ -48,7 +48,7 @@ block size is the product of the GPU batch size and the number of GPU batches
 prepare as many weights for the first layer as num_gpu_batches and load hidden for the first layer and the first batch.
 
 #### Generate
-<img src="https://github.com/FMInference/FlexLLMGen/raw/main/docs/generation_loop_overlap_multi_batch_mechanism.png" alt="image" width="750"></img>
+<img src="https://github.com/QuiverDance/flexgen/blob/readme/docs/generation_loop_overlap_multi_batch_mechanism.png" alt="image" width="750"></img>
 
 #### Epilogue
 store the hidden of the last batch of the layer layer.
