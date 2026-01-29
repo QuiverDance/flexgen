@@ -37,8 +37,10 @@ python3 -m flexllmgen.flex_llama --model meta-llama/Llama-3.1-70B --gpu-batch-si
 ### Scheduling Overview
 <img src="https://github.com/FMInference/FlexLLMGen/raw/main/docs/block_schedule.jpg" alt="image" width="500"></img>
 
-In this figure, Flexgen use Zig-zag block scheduling.
-Executes column-by-column for num_gpu_batches instead of full column-by-column scheduling.
+Flexgen use Zig-zag block scheduling.
+It executes column-by-column for num_gpu_batches instead of full column-by-column scheduling.
+
+block size is the product of the GPU batch size and the number of GPU batches
 
 ### Generation loop mechanism (multi batch)
 
