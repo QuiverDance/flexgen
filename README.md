@@ -38,19 +38,20 @@ python3 -m flexllmgen.flex_llama --model meta-llama/Llama-3.1-70B --gpu-batch-si
 <img src="https://github.com/FMInference/FlexLLMGen/raw/main/docs/block_schedule.jpg" alt="image" width="500"></img>
 
 Flexgen use Zig-zag block scheduling.
+
 It executes column-by-column for num_gpu_batches instead of full column-by-column scheduling.
 
 block size is the product of the GPU batch size and the number of GPU batches
 
 ### Generation loop mechanism (multi batch)
 
-#### Prologue
+#### 1.Prologue
 prepare as many weights for the first layer as num_gpu_batches and load hidden for the first layer and the first batch.
 
-#### Generate
+#### 2.Generate
 <img src="https://github.com/QuiverDance/flexgen/blob/readme/docs/generation_loop_overlap_multi_batch_mechanism.png" alt="image" width="750"></img>
 
-#### Epilogue
+#### 3.Epilogue
 store the hidden of the last batch of the layer layer.
 
 ### How to store weight
