@@ -126,6 +126,7 @@ class TorchTensor:
                 self.data.copy_(torch.from_numpy(np_array))
 
     def load_from_np_file(self, filename):
+        dtype_path = filename + ".dtype"
         if self.device.device_type == DeviceType.DISK:
             shutil.copy(filename, self.data)
             if os.path.exists(dtype_path):
@@ -134,7 +135,6 @@ class TorchTensor:
         else:
             np_array = np.load(filename, allow_pickle=False)
 
-            dtype_path = filename + ".dtype"
             if os.path.exists(dtype_path):
                 with open(dtype_path, "r") as f:
                     dtype_str = f.read().strip().lower()
@@ -910,6 +910,9 @@ def cut_indices(indices, start, stop, base=0):
 
 def map_to_torch_tensor(tensor, indices):
     if tensor.device.device_type == DeviceType.DISK:
+        np_arr = np.load(tensor.data, mmap_mode="r+")
+        data = torch.from_numpy(np_arr)
+        
         dtype_path = tensor.data + ".dtype"
         if os.path.exists(dtype_path):
             with open(dtype_path, "r") as f:
