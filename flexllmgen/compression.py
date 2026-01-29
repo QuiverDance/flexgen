@@ -8,6 +8,13 @@ from flexllmgen.pytorch_backend import (TorchTensor, TorchDevice,
 from flexllmgen.utils import np_dtype_to_torch_dtype
 
 
+def get_kv_heads(config):
+    kv_head = getattr(config, "num_key_value_heads", None)
+    if kv_head is None or kv_head == 0:
+        kv_head = config.n_head
+
+    return kv_head
+
 @dataclasses.dataclass
 class CompressionConfig:
     """Group-wise quantization."""
@@ -67,9 +74,10 @@ class TorchCompressedDevice:
 
         b = policy.gpu_batch_size
         n_head = config.n_head
+        n_kv_head = get_kv_heads(config)
         head_dim = config.input_dim // n_head
         max_seq_len = task.prompt_len + task.gen_len - 1
-        shape = (max_seq_len, b * n_head, head_dim)
+        shape = (max_seq_len, b * n_kv_head, head_dim)
 
         group_size, group_dim = (
             policy.comp_cache_config.group_size, policy.comp_cache_config.group_dim)

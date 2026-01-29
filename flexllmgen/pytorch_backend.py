@@ -234,6 +234,7 @@ class TorchDevice:
         if not policy.compress_cache:
             b = policy.gpu_batch_size
             n_head = config.n_head
+            n_kv_head = get_kv_heads(config)
             head_dim = config.input_dim // n_head
             max_seq_len = task.prompt_len + task.gen_len - 1
             self.attention_compute_workspace = []
@@ -242,7 +243,7 @@ class TorchDevice:
             # We currently separate SelfAttention and MLP as two layers,
             # so we only need one workspace instead of two.
             for i in range(1 if policy.sep_layer else 2):
-                shape = (max_seq_len, b * n_head, head_dim)
+                shape = (max_seq_len, b * n_kv_head, head_dim)
                 k_cache = self.allocate(shape, np.float32, pin_memory=False)
                 v_cache = self.allocate(shape, np.float32, pin_memory=False)
                 self.attention_compute_workspace.append((k_cache, v_cache))
