@@ -110,7 +110,7 @@ GPU, CPU, DISK 저장 비율만큼 segment length를 구해 각 device에 나누
 
 - GQA attention 추가
   - prefill: llama_gqa
-  - decode:: llama_gqa_gen
+  - decode: llama_gqa_gen
   - q는 n_head, kv는 num_key_value_heads 사용 
 
 - RoPE, RMSNorm 추가
