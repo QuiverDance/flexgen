@@ -1,6 +1,8 @@
 # FlexLLMGen for Llama 3 
 
 ----------
+## Original Flexgen
+`https://github.com/FMInference/FlexLLMGen`
 
 ## Content
 - [Installation](#installation)
